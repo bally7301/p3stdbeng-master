@@ -773,11 +773,66 @@ bool BPlusTree::gather_run(const std::string& key_bytes, std::uint32_t start,
     // while keys compare equal, pushing each entry's rid into `out`;
     // the run continues into next_leaf while the leaf's LAST key equals
     // the target. Stop at the first leaf whose last key differs.
-    (void)key_bytes;
-    (void)start;
-    (void)out;
-    (void)error;
+    
+    error.clear();
+    while(start != idx::kNoPage){
+        BptLeafPage leaf_page;
+        size_t frame = 0;
+
+        // Pin the leaf page
+        if(!pin_leaf(start, leaf_page, frame, error)){
             return false;
+        }
+
+        // Attach the page and check for errors
+        std::string attach_error;
+        if(!leaf_page.attach(attach_error)){
+            error =  "Leaf attach failed: " + attach_error;
+            release(manager_, frame, false);
+            return false;
+        }
+
+        size_t count = leaf_page.count();
+        uint32_t next_leaf = leaf_page.next_leaf();
+
+        bool last_key_equals_target = false;
+
+        if(count > 0){
+            auto last_entry = leaf_page.get_entry(count-1);
+            int previous_cmp = codec_.compare(last_entry.key.data(), key_bytes.data());
+            last_key_equals_target = (previous_cmp == 0);
+        }
+
+        bool target_exceed = false;
+
+        size_t start_index = leaf_page.lower_bound(key_bytes.data(), codec_);
+
+        for(size_t i = start_index; i < count ; i++){
+            auto entry = leaf_page.get_entry(i);
+            int cmp = codec_.compare(entry.key.data(), key_bytes.data());
+
+            if(cmp  == 0){
+                out.push_back(entry.rid);
+            }
+
+            else{
+                if(cmp > 0){
+                    target_exceed = true;
+                    break;
+                }
+            }
+        }
+        // Release the pin of the leaf frame
+        release(manager_, frame, false);
+
+        if(target_exceed || !last_key_equals_target){
+            break;
+        }
+
+        start = next_leaf;
+        
+    }
+    return true;
 }
 // BPlusTree::locate_in_run — finds the exact (key, rid) entry within
 // the equal-key run: the leaves are scanned for the pair, so the erase
