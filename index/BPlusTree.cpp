@@ -681,10 +681,78 @@ std::uint32_t BPlusTree::run_start(std::uint32_t landing,
     // compare its last entry's key with key_bytes, release; stop and
     // return `current` when prev is kNoPage or the tail does not equal
     // the target, else continue from prev.
-    (void)landing;
-    (void)key_bytes;
-    (void)error;
+
+    error.clear();
+
+   // Check if landing is valid
+   if(landing == idx::kNoPage) {
         return idx::kNoPage;
+    }
+
+    while(true){
+        BptLeafPage current_page;
+        size_t current_frame;
+        // Pin the leaf current page
+        if(!pin_leaf(landing, current_page, current_frame, error)){
+            return idx::kNoPage;
+        }
+
+        // Attach the page and check for errors
+        std::string attach_error;
+        if(!current_page.attach(attach_error)){
+            error =  "Leaf attach failed: " + attach_error;
+            release(manager_, current_frame, false);
+            return idx::kNoPage;
+        }
+
+        // Get the previous page  and un pin the page
+        std::uint32_t previous_block = current_page.prev_leaf();
+        release(manager_, current_frame, false);
+
+        // Has no previous page
+        if(previous_block == idx::kNoPage){
+            return landing;
+        }
+
+        BptLeafPage previous_page;
+        size_t previous_frame = 0;
+
+        // Pin the previous block
+        if(!pin_leaf(previous_block, previous_page, previous_frame, error)){
+            return idx::kNoPage;
+        }
+
+        // Attach the page and check for errors
+        if(!previous_page.attach(attach_error)){
+            error =  "Previous leaf attach failed: " + attach_error;
+            release(manager_, previous_frame, false);
+            return idx::kNoPage;
+        }
+
+        size_t previous_count = previous_page.count();
+        // Previous page is empty
+        if(previous_count == 0){
+           
+            release(manager_, previous_frame, false);
+            return landing;
+        }
+
+        // Get the last entry of the previous page
+        auto last_entry = previous_page.get_entry(previous_count-1);
+        release(manager_, previous_frame, false);
+
+        if(codec_.compare(last_entry.key.data(), key_bytes.data()) == 0){
+            landing = previous_block;
+
+        }
+        else{
+            return landing;
+        }
+
+    }
+
+
+
 }
 // BPlusTree::gather_run — collects every entry whose key equals the
 // target, scanning leaves left to right from `start`: the run continues
