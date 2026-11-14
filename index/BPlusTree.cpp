@@ -609,12 +609,54 @@ std::uint32_t BPlusTree::tree_search(std::uint32_t block,
     // (routing_child_index), release the pin, and recurse into that
     // child with levels_remaining - 1. An empty tree (kNoPage) also
     // returns kNoPage.
-    (void)block;
-    (void)levels_remaining;
-    (void)key_bytes;
-    (void)error;
+   
+    // Empty tree check returns kNoPage
+    if(block == idx::kNoPage){
         return idx::kNoPage;
     }
+
+    // Invalid level
+    if(levels_remaining == 0){
+        return idx::kNoPage;
+    }
+
+    // When levels_remaining is 1 this page IS the landing leaf — return its block
+    if(levels_remaining == 1){
+        return block;
+    }
+
+    BptSeparatorPage page;
+    size_t frame = 0;
+    // Pin this pages separator 
+    if(!pin_separator(block,page, frame, error)){
+        return idx::kNoPage;
+    }
+ 
+    // Attach the page and check for errors
+    std::string attach_error;
+    if(!page.attach(attach_error)){
+        error =  "Separator attach failed: " + attach_error;
+        release(manager_, frame, false);
+        return idx::kNoPage;
+    }
+
+    // take the child after the LAST separator <= key_bytes
+    size_t child_index = page.routing_child_index(key_bytes.data(), codec_);
+    std::uint32_t child_block;
+    if(child_index == 0){
+        child_block = page.first_child();
+    }
+    else{
+        child_block = page.child(child_index-1);
+    }
+
+    // Release the pin from the page
+    release(manager_, frame, false);
+
+    // Recurse into the child
+    return tree_search(child_block,levels_remaining-1, key_bytes, error);
+   
+}
 // BPlusTree::run_start — the equal-key run's leftmost leaf: walks left
 // from the landing leaf while the previous leaf's LAST key EQUALS the
 // target — the exact boundary test that gathers the boundary duplicates
@@ -643,7 +685,7 @@ std::uint32_t BPlusTree::run_start(std::uint32_t landing,
     (void)key_bytes;
     (void)error;
         return idx::kNoPage;
-    }
+}
 // BPlusTree::gather_run — collects every entry whose key equals the
 // target, scanning leaves left to right from `start`: the run continues
 // while a leaf's last key still compares equal. Lookup's answer walk.
@@ -668,7 +710,7 @@ bool BPlusTree::gather_run(const std::string& key_bytes, std::uint32_t start,
     (void)out;
     (void)error;
             return false;
-        }
+}
 // BPlusTree::locate_in_run — finds the exact (key, rid) entry within
 // the equal-key run: the leaves are scanned for the pair, so the erase
 // target can sit left of the landing leaf (boundary duplicates) or
