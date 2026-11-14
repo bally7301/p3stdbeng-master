@@ -613,8 +613,8 @@ std::uint32_t BPlusTree::tree_search(std::uint32_t block,
     (void)levels_remaining;
     (void)key_bytes;
     (void)error;
-    return idx::kNoPage;
-}
+        return idx::kNoPage;
+    }
 // BPlusTree::run_start — the equal-key run's leftmost leaf: walks left
 // from the landing leaf while the previous leaf's LAST key EQUALS the
 // target — the exact boundary test that gathers the boundary duplicates
@@ -642,8 +642,8 @@ std::uint32_t BPlusTree::run_start(std::uint32_t landing,
     (void)landing;
     (void)key_bytes;
     (void)error;
-    return idx::kNoPage;
-}
+        return idx::kNoPage;
+    }
 // BPlusTree::gather_run — collects every entry whose key equals the
 // target, scanning leaves left to right from `start`: the run continues
 // while a leaf's last key still compares equal. Lookup's answer walk.
@@ -667,8 +667,8 @@ bool BPlusTree::gather_run(const std::string& key_bytes, std::uint32_t start,
     (void)start;
     (void)out;
     (void)error;
-    return false;
-}
+            return false;
+        }
 // BPlusTree::locate_in_run — finds the exact (key, rid) entry within
 // the equal-key run: the leaves are scanned for the pair, so the erase
 // target can sit left of the landing leaf (boundary duplicates) or
@@ -700,8 +700,8 @@ bool BPlusTree::locate_in_run(const std::string& key_bytes, idx::Rid rid,
     (void)leaf_block;
     (void)pos;
     (void)error;
-    return false;
-}
+            return false;
+        }
 // BPlusTree::lookup — all entries whose key equals `key`: descend by
 // the lecture's routing, step left to the run's start, gather forward.
 // Duplicates are contiguous by key; an empty index answers nothing.
@@ -1613,13 +1613,184 @@ bool BPlusTree::verify_rec(std::uint32_t block, std::uint32_t depth,
     // minimum upward. At a leaf: order, every rid judged through
     // occupied (dangling findings), walked += count, depth range
     // updated, and the subtree minimum reported (nullopt when empty).
-    (void)block;
-    (void)depth;
-    (void)is_root;
-    (void)walk;
-    (void)error;
-    (void)subtree_min;
-    return false;
+    
+    // Resize seen when needed
+    if(block >= walk.seen.size()){
+        walk.seen.resize(block + 1);
+    }
+
+    /*
+    Uses the walk.seen vector to mark blocks as they are visited. 
+    If a block is encountered a second time, it logs a "reachable twice" finding,
+    preventing infinite recursion caused by corrupted pointer cycles*/
+    if(walk.seen[block] != 0){
+        walk.findings.push_back("Page " + std::to_string(block) + " is reachable twice (cycle detected).");
+        return true;
+    }
+
+    walk.seen[block] = 1;
+
+    // Node type based depth vs level
+    bool is_internal = depth < levels_;
+
+    // Retrieves the fixed byte width of encoded keys for the indexed column.
+    size_t kc = codec_.width();
+
+    if (is_internal){
+        BptSeparatorPage sep_page;
+        size_t frame = 0;
+
+        // Pin the separator page 
+        if(!pin_separator(block, sep_page, frame, error)){
+            walk.findings.push_back("Block " + std::to_string(block) + " is beyond the file or failed to pin as separator.");
+            return true;
+        }
+       
+        std::string attach_error;
+        if(!sep_page.attach(attach_error)){
+            walk.findings.push_back("Internal node " + std::to_string(block) + " failed page attach: " + attach_error);
+        }
+
+        size_t key_count = sep_page.count();
+
+        // Occupancy check. The root is excluded
+        if(!is_root && (key_count < min_separator_keys() || key_count > max_separator_keys())){
+            walk.findings.push_back("Internal node " + std::to_string(block) + " violates minimum/maximum separator occupancy.");
+        }
+
+        // Check for key order violation. All values to the left must be lesser than the right values.
+        for(size_t i = 1; i < key_count; i++){
+            const char* previous_k = sep_page.separator_key(i-1);
+            const char* current_k = sep_page.separator_key(i);
+            if(codec_.compare(previous_k, current_k)<0){
+                walk.findings.push_back("Internal node " + std::to_string(block) + " has unsorted separator keys.");
+                break;
+            }
+        }
+
+        // Recurse into children to check for exactness. Each separator key must equal its child's subtree minimum.
+        size_t child_count = key_count + 1;
+        std::optional<std::string>  first_child_min;
+        uint32_t first_child_block = sep_page.first_child();
+        if (!verify_rec(first_child_block, depth + 1, false, walk, error, &first_child_min)){
+            release(manager_, frame, false);
+            return false;
+        }
+
+        // Pass the first child min upwards 
+        if(subtree_min){
+            *subtree_min = first_child_min;
+        }
+  
+
+        // Recurse into the rest of the children to check for exactness. Each separator key must equal its child's subtree minimum.
+        for(size_t i = 0; i < key_count; i++){
+            std::optional<std::string>  child_min;
+            uint32_t child_block = sep_page.child(i);
+            if (!verify_rec(child_block, depth + 1, false, walk, error, &child_min)){
+                release(manager_, frame, false);
+                return false;
+            }
+
+            const char* separator_keys = sep_page.separator_key(i);
+            std::string separator_keys_str(separator_keys, kc);
+
+            // Separator exactness. Separator must equal its childs subtree minimum
+            if(child_min.has_value() && separator_keys_str != *child_min){
+                walk.findings.push_back("Separator key exactness violation at internal node " + 
+                                         std::to_string(block) + ", index " + std::to_string(i) + 
+                                        " (separator does not match child's subtree minimum).");
+            }
+            }
+        // Release the separator page
+        release(manager_, frame, false);
+        return true;
+
+        }
+        
+        // Leaf node verification
+        else{
+            
+            BptLeafPage leaf_page;
+            size_t frame = 0;
+
+            // Pin the leaf
+            if(!pin_leaf(block, leaf_page, frame, error)){
+                walk.findings.push_back("Block " + std::to_string(block) + " is beyond the file or failed to pin as leaf.");
+                return true;
+            }
+
+            std::string attach_error;
+            if(!leaf_page.attach(attach_error)){
+                walk.findings.push_back("Leaf node " + std::to_string(block) + " failed page attach: " + attach_error);
+            }
+
+            size_t entry_count = leaf_page.count();
+            bool has_previous = false;
+            std::string previous_encoded; 
+
+            // Check for key order violation. All values to the left must be lesser than the right values.
+            for(size_t i = 0; i < entry_count; i++){
+                auto entry = leaf_page.get_entry(i);
+                if(has_previous){
+                    if(codec_.compare(entry.key.data(), previous_encoded.data()) < 0){
+                        walk.findings.push_back("Leaf node " + std::to_string(block) + " has unsorted keys.");
+                        break;
+                    }
+                }
+                previous_encoded = entry.key;
+                has_previous = true;
+            }
+
+            // Occupancy check for leaf. Excludes the root
+            if(!is_root && (entry_count < min_leaf_entries() || entry_count > max_leaf_entries())){
+                walk.findings.push_back("Leaf node " + std::to_string(block) + " violates leaf occupancy rules.");
+            }
+
+            // Check depth. When depth min and max is 0 root
+            if(walk.min_depth == 0 && walk.max_depth == 0){
+                walk.min_depth = depth;
+                walk.max_depth = depth;
+            }
+            // Change to new min and max depth
+            else{
+                if(depth < walk.min_depth){
+                    walk.min_depth = depth;
+                }
+                if(depth > walk.max_depth){
+                    walk.max_depth= depth;
+                }
+            }
+            
+            // Check red in occupied callback. (dangling check)
+            for(size_t i = 0; i < entry_count; i++){
+                auto entry = leaf_page.get_entry(i);
+                if(walk.occupied && !walk.occupied(entry.rid)){
+                    walk.findings.push_back("Dangling RID found in leaf node " + std::to_string(block) + ".");
+                }
+            }
+
+            // Update to the walked path
+            walk.walked += entry_count;
+
+            // Report upwards the min subtree
+            if(subtree_min){
+                if(entry_count > 0){
+                    auto first_entry = leaf_page.get_entry(0);
+                    *subtree_min = first_entry.key;
+                }
+                else{
+                    *subtree_min = std::nullopt;
+                }
+            }
+
+            // Release the leaf page
+            release(manager_, frame, false);
+
+            return true;
+
+        }
+        
 }
 
 }
