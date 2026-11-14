@@ -899,9 +899,10 @@ bool BPlusTree::locate_in_run(const std::string& key_bytes, idx::Rid rid,
 
             if(cmp  == 0){
                 if(entry.rid == rid){
-                    found = true;
-                    found_index = i;
-                    break;
+                    leaf_block = start;
+                    pos = i;
+                    release(manager_, frame, false);
+                    return true;
                 }
             }
 
@@ -1171,13 +1172,97 @@ bool BPlusTree::insert_aux(std::uint32_t block, std::uint32_t levels_remaining,
     // its child becomes the new page's first child
     // (move_tail_to(middle + 1)), filling `split` for the parent. The
     // wrapper turns a root split into a new root.
-    (void)block;
-    (void)levels_remaining;
-    (void)key_bytes;
-    (void)rid;
-    (void)split;
-    (void)error;
-    return false;
+    
+    split = Split{};  // zero the carrier
+
+    if(levels_remaining <= 1){
+        return insert_leaf(block, key_bytes, rid, split, error);
+
+    }
+    BptSeparatorPage page;
+    std::size_t frame = 0;
+    if(!pin_separator(block, page, frame, error)){
+        return false;
+    }
+    std::size_t child_index = page.routing_child_index(key_bytes.data(), codec_);
+    std::uint32_t child_block = (child_index == 0) ? page.first_child() : page.child(child_index - 1);
+    release(manager_,frame,false);
+    Split child_split;
+    if(!insert_aux(child_block,levels_remaining-1,key_bytes,rid,child_split,error)){
+        return false;
+    }
+    if(child_split.new_block == idx::kNoPage){
+        return true;
+    }
+
+    if(!pin_separator(block,page,frame,error)){
+        return false;
+    }
+    idx::IndexEntry new_pair{
+        child_split.separator_key,
+        child_split.new_block
+    };
+    if(page.count()< max_separator_keys()){
+        bool ok = page.insert_pair_after(child_index,new_pair,error);
+        release(manager_,frame,ok);
+        return ok;
+    }
+    std::uint32_t original_first = page.first_child();
+
+    std::vector<idx::IndexEntry> pairs;
+    pairs.reserve(page.count()+1);
+    for (std::size_t i=0 ; i<page.count(); ++i){
+        pairs.push_back(page.entry(i));
+    }
+    pairs.insert(pairs.begin() + child_index, new_pair);
+    std::size_t middle = min_separator_keys();
+    idx::IndexEntry promoted = pairs[middle];
+    release(manager_,frame,false);
+    std::uint32_t right_block = 0;
+    std::size_t right_frame = 0;
+    if (!alloc_next_block(right_block,right_frame,error)){
+
+        return false;
+    }
+    BptSeparatorPage right;
+    right.bind(manager_.frame(right_frame).buffer, codec_.width());
+    right.format();
+
+    right.set_first_child(promoted.child);
+    if(!pin_separator(block,page,frame,error)){
+        release(manager_,right_frame,true);
+        return false;
+    }
+
+    page.format();
+    page.set_first_child(original_first);
+    bool ok = true;
+    for(std::size_t i=0; i<middle; ++i){
+        if(!page.append(pairs[i],error)){
+            ok = false;
+            break;
+        }
+    }
+
+    if(ok){
+        for(std::size_t i = middle + 1; i<pairs.size(); ++i){
+            if(!right.append(pairs[i],error)){
+                ok = false;
+                break;
+            }
+        }
+    }
+    if(ok){
+        split.separator_key = promoted.key;
+        split.new_block = right_block;
+    }
+    release(manager_,frame,true);
+    release(manager_,right_frame,true);
+    return ok;
+
+
+
+    
 }
 // BPlusTree::insert_leaf — the leaf phase of insert_aux: room within
 // 2d means a plain sorted insert; a full leaf (2d entries) splits per
@@ -1209,12 +1294,82 @@ bool BPlusTree::insert_leaf(std::uint32_t block, const std::string& key_bytes,
     // (equal keys go RIGHT — where the routing sends their duplicates).
     // Fill `split` with the copied-up separator (the new leaf's smallest
     // key) and the new block.
-    (void)block;
-    (void)key_bytes;
-    (void)rid;
-    (void)split;
-    (void)error;
-    return false;
+
+    split = Split{};  // zero the carrier
+    BptLeafPage leaf;
+    std::size_t frame = 0;
+    if (!pin_leaf(block, leaf, frame, error)) {
+        return false;
+    }
+
+    if(leaf.count() < max_leaf_entries()) {
+        bool ok = leaf.insert_entry(
+        idx::DataEntry(key_bytes, rid), codec_, error);
+        release(manager_, frame, ok);
+        return ok;
+    }
+    std::uint32_t old_next = leaf.next_leaf();
+    release(manager_, frame, false);
+    std::uint32_t new_block = 0;
+    std::size_t new_frame = 0;
+    if (!alloc_next_block(new_block, new_frame, error)) {
+        return false;
+    }
+    BptLeafPage fresh;
+    fresh.bind(manager_.frame(new_frame).buffer, codec_.width());
+    fresh.format(block, old_next);
+    if (!pin_leaf(block, leaf, frame, error)) {
+        release(manager_, new_frame, false);
+        return false;
+    }
+    BptLeafPage old_next_leaf;
+    
+    std::size_t old_next_frame = 0;
+    
+    bool has_next = (old_next != idx::kNoPage);
+
+    if(has_next){
+        if(!pin_leaf(old_next,old_next_leaf,old_next_frame, error)){
+
+            release(manager_,frame,false);
+            release(manager_,new_frame,true);
+            return false;
+        }
+    }
+
+    leaf.move_tail_to(min_leaf_entries(), fresh, codec_.width());
+    std::string boundary = fresh.get_entry(0).key;
+    bool ok = false;
+    if (codec_.compare(key_bytes.data(), boundary.data()) >= 0) {
+        ok = fresh.insert_entry(idx::DataEntry(key_bytes, rid), codec_, error);
+    } else {
+        ok = leaf.insert_entry(idx::DataEntry(key_bytes, rid), codec_, error);
+    }
+    if(!ok){
+        if(has_next){
+            release(manager_,old_next_frame,false);
+        }
+        release(manager_,frame,true);
+        release(manager_,new_frame,true);
+        return false;
+    }
+    leaf.set_next_leaf(new_block);
+
+    fresh.set_prev_leaf(block);
+    fresh.set_next_leaf(old_next);
+
+     if(has_next){
+            old_next_leaf.set_prev_leaf(new_block);
+        }
+        split.separator_key = fresh.get_entry(0).key;
+        split.new_block = new_block;
+        if(has_next){
+            release(manager_,old_next_frame,true);
+        }
+        release(manager_,frame,true);
+        release(manager_,new_frame,true);
+        return true;
+
 }
 
 // --- the recursion contract: erase ----------------------------------------------
@@ -1892,7 +2047,7 @@ bool BPlusTree::verify_rec(std::uint32_t block, std::uint32_t depth,
         for(size_t i = 1; i < key_count; i++){
             const char* previous_k = sep_page.separator_key(i-1);
             const char* current_k = sep_page.separator_key(i);
-            if(codec_.compare(previous_k, current_k)<0){
+            if(codec_.compare(previous_k, current_k)>0){
                 walk.findings.push_back("Internal node " + std::to_string(block) + " has unsorted separator keys.");
                 break;
             }
