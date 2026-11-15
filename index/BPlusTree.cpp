@@ -1500,13 +1500,68 @@ bool BPlusTree::erase_rec(std::uint32_t block, std::uint32_t levels_remaining,
     // child (set_separator_key) — or propagate the change upward when
     // the child is the first child. Fill `up` with this page's own
     // post-repair state.
-    (void)block;
-    (void)levels_remaining;
-    (void)key_bytes;
-    (void)rid;
-    (void)up;
-    (void)error;
-    return false;
+
+     // Initialize up.
+    up = EraseUp{};
+    error.clear();
+    // If this is a leaf, call erase_leaf()
+    // and return its result.
+    if(levels_remaining <= 1){
+        return erase_leaf(block, key_bytes, rid, up, error);
+
+    }
+    // Create BptSeparatorPage and frame.
+    BptSeparatorPage separator;
+    std::size_t frame = 0;
+    // Pin the separator page.
+    // On failure, return false.
+    if(!pin_separator(block, separator, frame, error)){
+        return false;
+    }
+     // Determine child_index using
+     // routing_child_index().
+
+     std::size_t child_index = separator.routing_child_index(key_bytes.data(), codec_);
+     // Determine child_block using
+     // first_child() or child().
+     std::uint32_t child_block = (child_index == 0) ? separator.first_child() : separator.child(child_index - 1);
+     // Unpin the parent before recursion.
+     release(manager_,frame,false);
+     // Create EraseUp child_up.
+     EraseUp child_up;
+      // Recursively call erase_rec() using
+      // levels_remaining - 1.
+      if(!erase_rec(child_block, levels_remaining - 1, key_bytes, rid, child_up, error)){
+        return false;
+    }
+     // Check whether the child underflowed.
+     if(child_up.underflow){
+        // If so, call fix_child_underflow().
+        if(!fix_child_underflow(block, levels_remaining, child_index, up, error)){
+            return false;
+        }
+        return true;
+    }
+    // Otherwise, if the child's first key changed:
+    if (child_up.first_changed){
+
+        // The first child has no separator of its own.
+        // Propagate its new minimum to our parent.
+        if(child_index == 0){
+            up.first_changed = true;
+            up.new_first = child_up.new_first;
+            return true;
+        }
+        // Re-pin the parent.
+        if(!pin_separator(block, separator, frame, error)){
+            return false;
+        }
+        separator.set_separator_key(child_index - 1, child_up.new_first.data());
+        release(manager_,frame,true);
+    }
+    // Deletion completed successfully.
+    return true;
+
 }
 // BPlusTree::erase_leaf — the leaf phase of erase_rec: find the exact
 // (key, rid) entry in this leaf's equal-key run, erase it (the
@@ -1532,12 +1587,64 @@ bool BPlusTree::erase_leaf(std::uint32_t block, const std::string& key_bytes,
     // fill `up`: underflow when count < min_leaf_entries(); when the
     // erased entry was the first, report whether the first key moved
     // (up.first_changed + up.new_first); an emptied leaf reports both.
-    (void)block;
-    (void)key_bytes;
-    (void)rid;
-    (void)up;
-    (void)error;
-    return false;
+    
+    // Initialize the upward carrier.
+    up = EraseUp{};
+    error.clear();
+    // Pin the leaf page.
+    BptLeafPage leaf;
+    std::size_t frame = 0;
+    if (!pin_leaf(block, leaf, frame, error)) {
+        return false;
+    }
+    // Find the first entry with  key >= target.
+    std::size_t pos = leaf.lower_bound(key_bytes.data(), codec_);
+    // Search the equal-key entries for the exact RID.
+    while (pos < leaf.count()){
+        const idx::DataEntry entry = leaf.get_entry(pos);
+        if (codec_.compare(entry.key.data(), key_bytes.data()) != 0){
+            break;
+        }
+        if (entry.rid == rid){
+            break;
+        }
+
+        ++pos;
+    }
+    // Report an error if the exact pair does not exist.
+    if (pos == leaf.count() || codec_.compare(leaf.get_entry(pos).key.data(), key_bytes.data()) != 0 || leaf.get_entry(pos).rid != rid) {
+        error  = "no index entry for key " + codec_.display(key_bytes.data()) + " and rid " + std::to_string(rid.page_id) + ":" + std::to_string(rid.slot);
+        release(manager_, frame, false);
+        return false;
+    }
+    // Remember the original minimum key.
+    const bool was_first = (pos == 0);
+    const std::string original_first_ = leaf.get_entry(0).key;
+    // Remove the exact entry.
+    if (!leaf.erase_entry(pos, error)) {
+        release(manager_, frame, false);
+        return false;
+    }
+    // Check whether the leaf has underflowed.
+    up.underflow = (leaf.count() < min_leaf_entries());
+    // Check whether the first key has changed.
+    if (leaf.count() == 0) {
+    
+        up.first_changed = true;
+        up.new_first.clear();
+    } else if (was_first) {
+        const std::string new_first = leaf.get_entry(0).key;
+        if(codec_.compare(original_first_.data(), new_first.data()) != 0){
+            up.first_changed = true;
+            up.new_first = new_first;
+        }
+    
+    }
+    // Release the modified leaf.
+    release(manager_, frame, true);
+    return true;
+
+    
 }
 // BPlusTree::fix_child_underflow — repairs a child holding fewer than d
 // entries: redistribute with a sibling that can lend (left preferred,
@@ -1567,12 +1674,72 @@ bool BPlusTree::fix_child_underflow(std::uint32_t block,
     // can lend (left preferred, then right — borrow_from_left /
     // borrow_from_right); otherwise merge_child. Fill `up` with this
     // page's own underflow state afterwards (a merge dropped one pair).
-    (void)block;
-    (void)levels_remaining;
-    (void)child_index;
-    (void)up;
-    (void)error;
-    return false;
+    
+    up = EraseUp{};  // zero the carrier
+    error.clear();
+    BptSeparatorPage separator;
+    std::size_t frame = 0;
+    // Pin the parent separator.
+    if(!pin_separator(block, separator, frame, error)){
+        return false;
+    }
+    // Determine the child and its siblings.
+    const std::size_t pair_count = separator.count();
+
+    if(child_index > pair_count){
+        error = "invalid child index during underflow repair";
+        release(manager_, frame, false);
+        return false;
+    }
+    const std::uint32_t child_block = (child_index == 0)? separator.first_child(): separator.child(child_index - 1);
+    std::uint32_t left_block = idx::kNoPage;
+    std::uint32_t right_block = idx::kNoPage;
+
+    if(child_index > 0){
+        left_block = (child_index == 1)? separator.first_child(): separator.child(child_index - 2);
+    }
+    if(child_index < pair_count){
+        right_block = separator.child(child_index);
+    }
+    // Release the parent before counting other pages.
+    release(manager_, frame, false);
+    // Determine the child's page type.
+    const bool child_is_leaf = (levels_remaining == 2);
+    const std::size_t minimum = (child_is_leaf)? min_leaf_entries(): min_separator_keys();
+    // Count entries in the underflowed child.
+    const std::size_t child_count = quick_count(child_block,child_is_leaf, error);
+
+    if(!error.empty()){
+        return false;
+    }
+    // Prefer borrowing from the left sibling.
+    if(left_block != idx::kNoPage){
+        const std::size_t left_count = quick_count(left_block,child_is_leaf, error);
+    if(!error.empty()){
+        return false;
+    }
+    if(left_count > minimum){
+        return borrow_from_left(block, child_index, child_block, left_block, child_is_leaf, child_count, up, error);
+    }
+    }
+    // Otherwise, try borrowing from the right sibling.
+    if(right_block != idx::kNoPage){
+        const std::size_t right_count = quick_count(right_block,child_is_leaf, error);
+    if(!error.empty()){
+        return false;
+    }
+    if(right_count > minimum){
+        return borrow_from_right(block, child_index, child_block, right_block, child_is_leaf, child_count, up, error);
+    }
+    }
+    // Neither sibling can lend.
+    // Merge with an existing sibling.
+    if(left_block == idx::kNoPage && right_block == idx::kNoPage){
+        error = "underflowed child has no sibling";
+        return false;
+    }
+    return merge_child(block, child_index, child_block, left_block, right_block, child_is_leaf, child_count, up, error);
+
 }
 // BPlusTree::quick_count — a page's occupancy for the repair decision
 // (can the sibling lend?), read through a short-lived pin.
@@ -1677,15 +1844,115 @@ bool BPlusTree::borrow_from_left(std::uint32_t block, std::size_t child_index,
     // key move through the parent (the child's new first child and first
     // key; the parent's separator becomes the moved key). Release
     // everything dirty; clear up.underflow.
-    (void)block;
-    (void)child_index;
-    (void)child_block;
-    (void)left_block;
-    (void)child_is_leaf;
-    (void)child_count;
-    (void)up;
-    (void)error;
-    return false;
+    
+    up = EraseUp{};
+    error.clear();
+    if(child_index == 0){
+        error = "cannot barrow left: no left sibling";
+        return false;
+    }
+    // Pin all three pages before modifying any of them.
+    std::unordered_map<std::uint32_t, std::size_t> frames;
+
+    if(!pin_surgery(manager_,file_,{block,left_block,child_block},frames,error)){
+        return false;
+    }
+     // Release all pages without writing changes on failure.
+     auto release_clean = [&](){
+        for(const auto& [page_block,frame]: frames){
+            release(manager_,frame,false);
+        }
+     };
+     // Bind the parent separator.
+     BptSeparatorPage parent;
+     parent.bind(
+        manager_.frame(frames.at(block)).buffer,codec_.width()
+     );
+     if(!parent.attach(error)){
+        release_clean();
+        return false;
+     }
+     const std::size_t separator_index = child_index - 1;
+     if (separator_index >= parent.count()){
+        error = "invalid separator index during left borrow";
+        release_clean();
+        return false;
+     }
+     if (child_is_leaf){
+        //Borrow from a leaf sibling.
+        BptLeafPage left;
+        BptLeafPage child;
+        left.bind( manager_.frame(frames.at(left_block)).buffer,codec_.width());
+        child.bind( manager_.frame(frames.at(child_block)).buffer,codec_.width());
+        if(!left.attach(error)|| !child.attach(error)){
+            release_clean();
+            return false;
+        }
+        if(left.count() <= min_leaf_entries() || 
+    child.count()!= child_count){
+        error = "invalid leaf occupancy during left borrow";
+        release_clean();
+        return false;
+    }
+    // Get the last entry from the left sibling.
+    idx::DataEntry moved = left.get_entry(left.count() - 1);
+     // Insert it into the underflowed child.
+     if(!child.insert_entry(moved, codec_, error)){
+        release_clean();
+        return false;
+     }
+     // Remove the borrowed entry from the left sibling.
+     if(!left.erase_entry(left.count() - 1, error)){
+        release_clean();
+        return false;
+     }
+     // Update the parent with the child's new first key.
+     const std::string new_first = child.get_entry(0).key;
+     parent.set_separator_key(separator_index, new_first.data());
+     }
+     else {
+        //  Borrow from an internal separator sibling.
+          BptSeparatorPage left;
+          BptSeparatorPage child;
+          left.bind( manager_.frame(frames.at(left_block)).buffer,codec_.width());
+        child.bind( manager_.frame(frames.at(child_block)).buffer,codec_.width());
+        if(!left.attach(error)|| !child.attach(error)){
+            release_clean();
+            return false;
+        }
+        if(left.count() <= min_separator_keys() || 
+        child.count()!= child_count){
+        error = "invalid separator occupancy during left borrow";
+        release_clean();
+        return false;
+        }
+        // Save the left sibling's last pair.
+        const std::size_t last = left.count() - 1;
+        idx::IndexEntry moved = left.entry(last);
+        // Save the parent's boundary key.
+        std::string parent_key( parent.separator_key(separator_index), codec_.width());
+        // Save the child's original first child.
+        const std:: uint32_t old_first_child = child.first_child();
+          // Insert the parent's old separator into the child.
+          if(!child.insert_pair_after(0, idx::IndexEntry{parent_key,old_first_child}, error)){
+            release_clean();
+            return false;
+          }
+        // The borrowed pointer becomes the child's first child.
+        child.set_first_child(moved.child);
+        // Remove the transferred pair from the left sibling.
+          left.erase_pair(last, codec_.width());
+          parent.set_separator_key(separator_index, moved.key.data());
+     }
+     // All modified pages must be written back.
+     release_surgery(manager_, frames);
+     // The underflow has been repaired.
+     up.underflow = false;
+     up.first_changed = false;
+
+     return true;
+    
+    
 }
 // BPlusTree::borrow_from_right — redistribution from the right sibling
 // (slide 41): a leaf child gains the sibling's first entry at its end;
@@ -1721,15 +1988,121 @@ bool BPlusTree::borrow_from_right(std::uint32_t block, std::size_t child_index,
     // rewrites (or propagates) its left boundary. Separator child:
     // rotate — the sibling's first child and first key move through the
     // parent. Release everything dirty; clear up.underflow.
-    (void)block;
-    (void)child_index;
-    (void)child_block;
-    (void)right_block;
-    (void)child_is_leaf;
-    (void)child_count;
-    (void)up;
-    (void)error;
-    return false;
+     up = EraseUp{};
+    error.clear();
+    
+    // Pin all three pages before modifying any of them.
+    std::unordered_map<std::uint32_t, std::size_t> frames;
+
+    if(!pin_surgery(manager_,file_,{block,child_block,right_block},frames,error)){
+        return false;
+    }
+     // Release all pages without writing changes on failure.
+     auto release_clean = [&](){
+        for(const auto& [page_block,frame]: frames){
+            release(manager_,frame,false);
+        }
+     };
+     // Bind the parent separator.
+     BptSeparatorPage parent;
+     parent.bind(
+        manager_.frame(frames.at(block)).buffer,codec_.width()
+     );
+     if(!parent.attach(error)){
+        release_clean();
+        return false;
+     }
+
+     if (child_index >= parent.count()|| parent.child(child_index) != right_block){
+        error = "invalid right sibling during underflow repair";
+        release_clean();
+        return false;
+     }
+     if (child_is_leaf){
+        //Borrow from a leaf sibling.
+        BptLeafPage right;
+        BptLeafPage child;
+        right.bind( manager_.frame(frames.at(right_block)).buffer,codec_.width());
+        child.bind( manager_.frame(frames.at(child_block)).buffer,codec_.width());
+        if(!right.attach(error)|| !child.attach(error)){
+            release_clean();
+            return false;
+        }
+        if(right.count() <= min_leaf_entries() || 
+        child.count()!= child_count){
+        error = "invalid leaf occupancy during right borrow";
+        release_clean();
+        return false;
+    }
+    // Get the last entry from the left sibling.
+    idx::DataEntry moved = right.get_entry(0);
+     // Insert it into the underflowed child.
+     if(!child.insert_entry(moved, codec_, error)){
+        release_clean();
+        return false;
+     }
+     // Remove the borrowed entry from the left sibling.
+     if(!right.erase_entry(0, error)){
+        release_surgery(manager_, frames);
+        return false;
+     }
+     // Update the parent with the child's new first key.
+     const std::string right_minimum = right.get_entry(0).key;
+     parent.set_separator_key(child_index, right_minimum.data());
+
+    // Refresh the repaired child's left boundary as well.
+    const std::string child_minimum = child.get_entry(0).key;
+    if(child_index > 0){
+                parent.set_separator_key(child_index - 1, child_minimum.data());
+      }
+      else{
+         // The first child has no separator in this parent.
+         // Propagate its new minimum upward.
+        up.first_changed = true;
+        up.new_first = child_minimum;
+      }
+     }
+     else {
+        //  Borrow from an internal separator sibling.
+          BptSeparatorPage right;
+          BptSeparatorPage child;
+          right.bind( manager_.frame(frames.at(right_block)).buffer,codec_.width());
+        child.bind( manager_.frame(frames.at(child_block)).buffer,codec_.width());
+        if(!right.attach(error)|| !child.attach(error)){
+            release_clean();
+            return false;
+        }
+        if(right.count() <= min_separator_keys() || 
+        child.count()!= child_count){
+        error = "invalid separator occupancy during right borrow";
+        release_clean();
+        return false;
+        }
+        
+        // Save the parent's boundary key.
+        std::string parent_key( parent.separator_key(child_index), codec_.width());
+        // Save the right sibling's first child pointer.
+        const std:: uint32_t moved_child = right.first_child();
+        // Save the right sibling's first separator pair.
+        idx::IndexEntry first_pair = right.entry(0);
+        // Move the parent's key and the right sibling's
+        // first child pointer into the underflowed node.
+          if(!child.append( idx::IndexEntry{parent_key,moved_child}, error)){
+            release_clean();
+            return false;
+          }
+         // Update the right sibling's first child pointer.
+        right.set_first_child(first_pair.child);
+        // Remove the transferred pair from the left sibling.
+          right.erase_pair(0, codec_.width());
+          parent.set_separator_key(child_index, first_pair.key.data());
+     }
+     // All modified pages must be written back.
+     release_surgery(manager_, frames);
+     // The underflow has been repaired.
+     up.underflow = false;
+
+     return true;
 }
 // BPlusTree::merge_child — the merge (slides 42-43, 47): the
 // underflowed child folds into its left sibling (preferred) or right
@@ -1769,16 +2142,162 @@ bool BPlusTree::merge_child(std::uint32_t block, std::size_t child_index,
     // the separator from the parent (erase_pair), chain the vanished
     // page onto the free list (chain_freed), and report the parent's own
     // underflow upward (up.underflow).
-    (void)block;
-    (void)child_index;
-    (void)child_block;
-    (void)left_block;
-    (void)right_block;
-    (void)child_is_leaf;
-    (void)child_count;
-    (void)up;
-    (void)error;
-    return false;
+    
+    up = EraseUp();
+    error.clear();
+    //  Prefer merging with the left sibling.
+    const bool use_left = (left_block != idx::kNoPage);
+
+    if(!use_left && right_block == idx::kNoPage){
+        error = "cannot merge: child has no sibling";
+        return false;
+    }    
+    if(use_left && child_index == 0){
+        error = "cannot merge left from first child";
+        return false;
+    }  
+    const std::uint32_t survivor_block = use_left ? left_block : child_block;
+    const std::uint32_t vanished_block = use_left ? child_block : right_block;
+    const std::uint32_t separator_index = use_left ? child_index - 1 : child_index;
+
+    // Find the successor of the disappearing leaf.
+    std::uint32_t next_block = idx::kNoPage;
+
+    if(child_is_leaf){
+        BptLeafPage vanished;
+        std::size_t frame = 0;
+        if(!pin_leaf(vanished_block, vanished, frame, error)){
+            return false; 
+        }
+        next_block = vanished.next_leaf();
+        release(manager_,frame,false);
+    }
+    // Pin all pages involved in the merge.
+    std::vector<std::uint32_t> blocks = {
+        block, survivor_block, vanished_block
+    };
+    if(child_is_leaf && next_block != idx::kNoPage){
+        blocks.push_back(next_block);
+    }
+    std::unordered_map<std::uint32_t,std::size_t> frames;
+    if(!pin_surgery(manager_,file_,blocks,frames, error)){
+        return false;
+    }
+    auto release_clean = [&](){
+        for(const auto& [page_block,frame]: frames){
+            release(manager_,frame,false);
+        }
+     };
+     //  Attach the parent separator.
+     BptSeparatorPage parent;
+     parent.bind(manager_.frame(frames.at(block)).buffer, codec_.width());
+
+     if(!parent.attach(error)){
+        release_clean();
+        return false;
+
+     }
+     if(separator_index >= parent.count() || parent.child(separator_index) != vanished_block){
+        error = "invalid parent separator during during merge";
+        release_clean();
+        return false;
+     }
+     // Merge leaf pages.
+     if(child_is_leaf){
+        BptLeafPage survivor;
+        BptLeafPage vanished;
+        survivor.bind(manager_.frame(frames.at(survivor_block)).buffer, codec_.width());
+        vanished.bind(manager_.frame(frames.at(vanished_block)).buffer, codec_.width());
+
+        if(!survivor.attach(error)|| !vanished.attach(error)){
+            release_clean();
+            return false;
+        }
+        const std::size_t actual_child_count = use_left ? vanished.count(): survivor.count();
+        
+        if(actual_child_count != child_count || survivor.count() + vanished.count() > max_leaf_entries()){
+            error = "invalid leaf occupancy during merge";
+            release_clean();
+            return false;
+        }
+        // Validate the next leaf before making changes.
+        BptLeafPage next;
+        if (next_block != idx::kNoPage){
+            next.bind(manager_.frame(frames.at(next_block)).buffer, codec_.width());
+        if(!next.attach(error)){
+            release_clean();
+            return false;
+        }
+        
+        }
+         // Move every entry into the surviving leaf.
+         const std::size_t count = vanished.count();
+         for(std::size_t i = 0; i < count; ++i){
+            const idx::DataEntry entry = vanished.get_entry(i);
+            if(!survivor.insert_entry(entry, codec_, error)){
+                release_surgery(manager_, frames);
+                return false;
+            }
+
+         }
+         // Repair the doubly linked leaf chain.
+         survivor.set_next_leaf(next_block);
+         if(next_block != idx::kNoPage){
+            next.set_prev_leaf(survivor_block);
+         }
+        // A first-child right merge can change the
+        // subtree's smallest key.
+        if(!use_left && survivor.count() > 0){
+            up.first_changed = true;
+            up.new_first = survivor.get_entry(0).key;
+        }
+
+     }
+     else{
+        //  Merge internal separator pages.
+       BptSeparatorPage survivor;
+       BptSeparatorPage vanished;
+        survivor.bind(manager_.frame(frames.at(survivor_block)).buffer, codec_.width());
+        vanished.bind(manager_.frame(frames.at(vanished_block)).buffer, codec_.width());
+        if(!survivor.attach(error)|| !vanished.attach(error)){
+            release_clean();
+            return false;
+        }
+        const std::size_t actual_child_count = use_left ? vanished.count(): survivor.count();
+        
+        if(actual_child_count != child_count || survivor.count() + 1 + vanished.count() > max_separator_keys()){
+            error = "invalid separator occupancy during merge";
+            release_clean();
+            return false;
+        }
+        // Move the parent's boundary key into the survivor.
+        const std::string boundary_key( parent.separator_key(separator_index),codec_.width());
+        if(!survivor.append(idx::IndexEntry{boundary_key,vanished.first_child()}, error)){
+            release_clean();
+            return false;
+        }
+        // Append all pairs from the disappearing node.
+        const std::size_t count = vanished.count();
+        for(std::size_t i = 0; i < count; ++i ){
+            if(!survivor.append(vanished.entry(i), error)){
+                release_surgery(manager_, frames);
+                return false;
+            }
+        }
+    }
+
+    // Remove the obsolete separator from parent.
+    parent.erase_pair(separator_index, codec_.width());
+    // Add the unused page to the free list.
+    chain_freed(vanished_block, manager_.frame(frames.at(vanished_block)).buffer);
+    //  Report whether the parent now underflows.
+    up.underflow = parent.count() < min_separator_keys();
+    // Save modifications to all affected pages.
+    release_surgery(manager_,frames);
+    return true;
+    
+    
+    
 }
 // BPlusTree::rebuild_from_leaves — the crossed-subtree erase's simple
 // correct repair: collect every entry by walking the leaf chain, close
