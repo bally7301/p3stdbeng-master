@@ -1172,52 +1172,69 @@ bool BPlusTree::insert_aux(std::uint32_t block, std::uint32_t levels_remaining,
     // its child becomes the new page's first child
     // (move_tail_to(middle + 1)), filling `split` for the parent. The
     // wrapper turns a root split into a new root.
-    
+     // Initialize the split information.
+    // This will store information if the current node splits.
     split = Split{};  // zero the carrier
-
+    // Base case: If we reach the leaf level,
+    // call insert_leaf() to handle the actual insertion.
     if(levels_remaining <= 1){
         return insert_leaf(block, key_bytes, rid, split, error);
 
     }
+    // Find the correct child to insert the new key.
     BptSeparatorPage page;
     std::size_t frame = 0;
+    // Load the current internal node into memory.
     if(!pin_separator(block, page, frame, error)){
         return false;
     }
+    // Determine which child should contain the new key.
     std::size_t child_index = page.routing_child_index(key_bytes.data(), codec_);
+    // Get the block number of the selected child.
     std::uint32_t child_block = (child_index == 0) ? page.first_child() : page.child(child_index - 1);
+    // Release the current page before descending.
     release(manager_,frame,false);
+    // Recursively insert into the selected child.
     Split child_split;
     if(!insert_aux(child_block,levels_remaining-1,key_bytes,rid,child_split,error)){
         return false;
     }
+    // If the child did not split, no parent update is needed.
     if(child_split.new_block == idx::kNoPage){
         return true;
     }
-
+    //  The child split, so insert its new separator into this node.
     if(!pin_separator(block,page,frame,error)){
         return false;
     }
+    // Create an index entry with the promoted separator key
+    // and the block number of the child's new right page.
     idx::IndexEntry new_pair{
         child_split.separator_key,
         child_split.new_block
     };
+    // If this internal node has space, insert the separator.
     if(page.count()< max_separator_keys()){
         bool ok = page.insert_pair_after(child_index,new_pair,error);
         release(manager_,frame,ok);
         return ok;
     }
+    // The internal node is full and must also split.
+    // Save its original first child pointer.
     std::uint32_t original_first = page.first_child();
-
+    // Temporarily collect the existing separator entries.
     std::vector<idx::IndexEntry> pairs;
     pairs.reserve(page.count()+1);
     for (std::size_t i=0 ; i<page.count(); ++i){
         pairs.push_back(page.entry(i));
     }
+     // Insert the new separator into its correct position.
     pairs.insert(pairs.begin() + child_index, new_pair);
+    // Select the middle separator to promote to the parent.
     std::size_t middle = min_separator_keys();
     idx::IndexEntry promoted = pairs[middle];
     release(manager_,frame,false);
+    // Allocate and initialize a new right internal node.
     std::uint32_t right_block = 0;
     std::size_t right_frame = 0;
     if (!alloc_next_block(right_block,right_frame,error)){
@@ -1227,23 +1244,26 @@ bool BPlusTree::insert_aux(std::uint32_t block, std::uint32_t levels_remaining,
     BptSeparatorPage right;
     right.bind(manager_.frame(right_frame).buffer, codec_.width());
     right.format();
-
+    // The promoted entry's child becomes the first child
+    // of the new right internal node.
     right.set_first_child(promoted.child);
+   // Reload the original internal node so it can be rebuilt.
     if(!pin_separator(block,page,frame,error)){
         release(manager_,right_frame,true);
         return false;
     }
-
+    // Clear and rebuild the original node as the left half.
     page.format();
     page.set_first_child(original_first);
     bool ok = true;
+    // Copy entries before the middle separator into the left node.
     for(std::size_t i=0; i<middle; ++i){
         if(!page.append(pairs[i],error)){
             ok = false;
             break;
         }
     }
-
+    // Copy entries after the middle separator into the right node.
     if(ok){
         for(std::size_t i = middle + 1; i<pairs.size(); ++i){
             if(!right.append(pairs[i],error)){
@@ -1252,10 +1272,13 @@ bool BPlusTree::insert_aux(std::uint32_t block, std::uint32_t levels_remaining,
             }
         }
     }
+    // Send the promoted separator and new right node
+    // information to the parent so the split can propagate upward.
     if(ok){
         split.separator_key = promoted.key;
         split.new_block = right_block;
     }
+    // Release both modified internal pages.
     release(manager_,frame,true);
     release(manager_,right_frame,true);
     return ok;
@@ -1294,34 +1317,41 @@ bool BPlusTree::insert_leaf(std::uint32_t block, const std::string& key_bytes,
     // (equal keys go RIGHT — where the routing sends their duplicates).
     // Fill `split` with the copied-up separator (the new leaf's smallest
     // key) and the new block.
-
+    // Initialize the split information and load the leaf page.
     split = Split{};  // zero the carrier
     BptLeafPage leaf;
     std::size_t frame = 0;
+    // Pin the leaf page in memory so it can be accessed and modified.
     if (!pin_leaf(block, leaf, frame, error)) {
         return false;
     }
-
+    // If the leaf has space, insert the new entry without splitting.
     if(leaf.count() < max_leaf_entries()) {
         bool ok = leaf.insert_entry(
         idx::DataEntry(key_bytes, rid), codec_, error);
         release(manager_, frame, ok);
         return ok;
     }
+    // The leaf is full, so prepare to split it.
+    // Save the next leaf's block number to maintain the linked list.
     std::uint32_t old_next = leaf.next_leaf();
     release(manager_, frame, false);
     std::uint32_t new_block = 0;
     std::size_t new_frame = 0;
+    // Allocate a new page for the right half of the split.
     if (!alloc_next_block(new_block, new_frame, error)) {
         return false;
     }
+    // Initialize the new leaf with the original leaf's neighbors.
     BptLeafPage fresh;
     fresh.bind(manager_.frame(new_frame).buffer, codec_.width());
     fresh.format(block, old_next);
+    // Re-pin the original leaf so its entries can be moved.
     if (!pin_leaf(block, leaf, frame, error)) {
         release(manager_, new_frame, false);
         return false;
     }
+    // Prepare to update the previous pointer of the old next leaf.
     BptLeafPage old_next_leaf;
     
     std::size_t old_next_frame = 0;
@@ -1336,15 +1366,22 @@ bool BPlusTree::insert_leaf(std::uint32_t block, const std::string& key_bytes,
             return false;
         }
     }
+    //Split the entries between the original and new leaf.
+    // Keep the minimum number of entries in the original leaf.
+    // Move the remaining entries into the new right leaf.
 
     leaf.move_tail_to(min_leaf_entries(), fresh, codec_.width());
+    // The first key in the new leaf determines the split boundary.
     std::string boundary = fresh.get_entry(0).key;
+    //Insert the new entry into the correct half.
+    // Keys equal to or greater than the boundary go to the right leaf.
     bool ok = false;
     if (codec_.compare(key_bytes.data(), boundary.data()) >= 0) {
         ok = fresh.insert_entry(idx::DataEntry(key_bytes, rid), codec_, error);
     } else {
         ok = leaf.insert_entry(idx::DataEntry(key_bytes, rid), codec_, error);
     }
+    // Handle insertion failure and release pinned pages.
     if(!ok){
         if(has_next){
             release(manager_,old_next_frame,false);
@@ -1353,19 +1390,26 @@ bool BPlusTree::insert_leaf(std::uint32_t block, const std::string& key_bytes,
         release(manager_,new_frame,true);
         return false;
     }
+    // Update the doubly linked list of leaf pages.
+    // Original leaf now points to the newly created leaf.
     leaf.set_next_leaf(new_block);
-
+    // New leaf points backward to the original leaf.
     fresh.set_prev_leaf(block);
+    // New leaf points forward to the original next leaf.
     fresh.set_next_leaf(old_next);
-
+    // Update the old next leaf's previous pointer, if it exists.
      if(has_next){
             old_next_leaf.set_prev_leaf(new_block);
         }
+        // Return split information to the parent node.
+        // The separator is the smallest key in the new right leaf.
         split.separator_key = fresh.get_entry(0).key;
         split.new_block = new_block;
+        // Release modified pages and mark them dirty.
         if(has_next){
             release(manager_,old_next_frame,true);
         }
+        // Release both modified internal pages.
         release(manager_,frame,true);
         release(manager_,new_frame,true);
         return true;
